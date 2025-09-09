@@ -1,0 +1,37 @@
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: [
+      'build',
+      '-t', 'gcr.io/$PROJECT_ID/dv360-analytics:$BUILD_ID',
+      '-t', 'gcr.io/$PROJECT_ID/dv360-analytics:latest',
+      '.'
+    ]
+
+  # Push the container image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '--all-tags', 'gcr.io/$PROJECT_ID/dv360-analytics']
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'dv360-analytics'
+      - '--image=gcr.io/$PROJECT_ID/dv360-analytics:latest'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--max-instances=10'
+      - '--memory=2Gi'
+      - '--cpu=2'
+      - '--timeout=900'
+      - '--set-env-vars=BQ_PROJECT=$PROJECT_ID,BQ_DATASET=madkpi,BQ_TABLE=madkpi_data_sep_to_jan,GEMINI_MODEL=gemini-1.5-flash'
+      - '--set-secrets=GOOGLE_API_KEY=gemini-api-key:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+substitutions:
+  _REGION: us-central1
