@@ -81,11 +81,21 @@ class BigQueryManager:
         try:
             query_job = self.client.query(sql_query)
             results = query_job.result()
-            df = results.to_dataframe()
+
+            # Try to import db-dtypes to handle NUMERIC/BIGNUMERIC
+            try:
+                import db_dtypes  # noqa: F401
+                df = results.to_dataframe(create_bqstorage_client=False)
+            except ImportError:
+                logger.warning("db-dtypes not found — falling back to string conversion")
+                df = results.to_dataframe(create_bqstorage_client=False)
+                df = df.astype(str)
+
             return df
         except Exception as e:
             logger.error(f"Query execution failed: {e}")
             raise HTTPException(status_code=500, detail=f"Query execution failed: {str(e)}")
+
     
     def get_sample_data(self, limit: int = 5) -> pd.DataFrame:
         """Get sample data for user reference."""
@@ -220,6 +230,7 @@ class AnalyticsService:
             
             # Step 4: Execute query
             results_df = self.bq_manager.execute_query(sql_query)
+            print("results_df", results_df)
             
             if results_df.empty:
                 yield self._create_block("error", {
