@@ -5,6 +5,8 @@ import logging
 from typing import List, Dict, Optional, AsyncGenerator
 from datetime import datetime
 import pandas as pd
+from decimal import Decimal
+import numpy as np
 from google.cloud import bigquery
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException
@@ -16,6 +18,19 @@ import uvicorn
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+class DecimalEncoder(json.JSONEncoder):
+    """Custom JSON encoder to handle Decimal objects."""
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if pd.isna(obj):
+            return None
+        return super(DecimalEncoder, self).default(obj)
 
 class Config:
     """Configuration class for the application."""
@@ -76,6 +91,22 @@ class BigQueryManager:
             logger.error(f"Failed to get table columns: {e}")
             return []
     
+    def _convert_decimals_to_float(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Convert Decimal objects to float in the DataFrame."""
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                # Check if column contains Decimal objects
+                if not df[col].empty and isinstance(df[col].iloc[0], Decimal):
+                    df[col] = df[col].astype(float)
+                # Also handle string representations of numbers that might be Decimals
+                elif df[col].dtype == 'object':
+                    try:
+                        # Try to convert to numeric, coercing errors to NaN
+                        df[col] = pd.to_numeric(df[col], errors='ignore')
+                    except:
+                        pass
+        return df
+    
     def execute_query(self, sql_query: str) -> pd.DataFrame:
         """Execute SQL query and return results as DataFrame."""
         try:
@@ -91,6 +122,9 @@ class BigQueryManager:
                 df = results.to_dataframe(create_bqstorage_client=False)
                 df = df.astype(str)
 
+            # Convert Decimal objects to float for JSON serialization
+            df = self._convert_decimals_to_float(df)
+            
             return df
         except Exception as e:
             logger.error(f"Query execution failed: {e}")
@@ -132,7 +166,12 @@ class GeminiManager:
         Return ONLY the SQL query without any explanations or markdown formatting.
         Use the fully qualified table name (project.dataset.table) in the FROM clause.
         Use appropriate aggregations and filters.
-        If any column that looks numeric (e.g., Revenue, Impressions, Cost) is of type STRING, cast it to FLOAT64 before aggregation.
+        
+        IMPORTANT: For numeric columns (Revenue, Cost, Impressions, etc.):
+        - Always use CAST(column AS FLOAT64) instead of BIGNUMERIC or NUMERIC
+        - This prevents Decimal serialization issues in the API response
+        - Example: SELECT CAST(SUM(CAST(Revenue AS FLOAT64)) AS FLOAT64) as total_revenue
+        
         For date columns, use BigQuery functions such as FORMAT_DATE(), DATE_TRUNC(), or PARSE_DATE().
         For any calculations that involve division, use SAFE_DIVIDE() to avoid division by zero errors.
         Important:
@@ -154,13 +193,20 @@ class GeminiManager:
     
     def analyze_results(self, user_prompt: str, sql_query: str, results_df: pd.DataFrame) -> str:
         """Analyze query results and provide insights."""
+        # Convert DataFrame to string representation to avoid Decimal serialization in the prompt
+        df_sample = results_df.head(10).copy()
+        
+        # Convert all values to strings for safe string representation
+        for col in df_sample.columns:
+            df_sample[col] = df_sample[col].astype(str)
+        
         prompt = f"""
         User's original question: {user_prompt}
         
         SQL query used: {sql_query}
         
         Query results (first 10 rows):
-        {results_df.head(10).to_string()}
+        {df_sample.to_string()}
         
         Please provide:
         1. A clear summary of what the data shows
@@ -195,6 +241,20 @@ class AnalyticsService:
             self.gemini_manager = GeminiManager(self.config.gemini_model)
         else:
             raise Exception("Failed to setup credentials")
+    
+    def _safe_json_serialize(self, data):
+        """Safely serialize data to JSON, handling Decimals and other non-serializable types."""
+        try:
+            return json.loads(json.dumps(data, cls=DecimalEncoder))
+        except Exception as e:
+            logger.error(f"JSON serialization error: {e}")
+            # Fallback: convert problematic values to strings
+            if isinstance(data, dict):
+                return {k: str(v) if isinstance(v, (Decimal, np.integer, np.floating)) else v for k, v in data.items()}
+            elif isinstance(data, list):
+                return [str(item) if isinstance(item, (Decimal, np.integer, np.floating)) else item for item in data]
+            else:
+                return str(data)
     
     async def stream_analysis(self, user_prompt: str) -> AsyncGenerator[str, None]:
         """Stream analysis results in NDJSON format."""
@@ -254,7 +314,45 @@ class AnalyticsService:
             })
             
             # Step 6: Show data table (limit to first 100 rows for performance)
-            table_data = results_df.head(100).to_dict('records')
+            # Convert DataFrame to dict with aggressive Decimal handling
+            table_data = []
+            for _, row in results_df.head(100).iterrows():
+                row_data = {}
+                for col, value in row.items():
+                    # Aggressive conversion of any potential problematic types
+                    if isinstance(value, Decimal):
+                        row_data[col] = float(value)
+                    elif isinstance(value, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+                        row_data[col] = int(value)
+                    elif isinstance(value, (np.floating, np.float64, np.float32, np.float16)):
+                        row_data[col] = float(value)
+                    elif pd.isna(value) or str(value).lower() in ['nan', 'none', 'null']:
+                        row_data[col] = None
+                    elif hasattr(value, 'item'):  # NumPy scalar
+                        try:
+                            row_data[col] = value.item()
+                        except:
+                            row_data[col] = str(value)
+                    else:
+                        # Try to convert string representations of Decimals
+                        try:
+                            if isinstance(value, str) and '.' in value and value.replace('.', '').replace('-', '').isdigit():
+                                row_data[col] = float(value)
+                            else:
+                                row_data[col] = value
+                        except:
+                            row_data[col] = str(value) if value is not None else None
+                
+                # Final safety check for the entire row
+                try:
+                    json.dumps(row_data, cls=DecimalEncoder)
+                    table_data.append(row_data)
+                except Exception as e:
+                    logger.warning(f"Row serialization issue, converting to strings: {e}")
+                    # Convert entire row to strings as fallback
+                    safe_row = {k: str(v) if v is not None else None for k, v in row_data.items()}
+                    table_data.append(safe_row)
+            
             columns = [{"key": col, "label": col, "sortable": True} for col in results_df.columns]
             
             yield self._create_block("table", {
@@ -301,9 +399,9 @@ class AnalyticsService:
         block = {
             "type": block_type,
             "timestamp": datetime.now().isoformat(),
-            "data": data
+            "data": self._safe_json_serialize(data)
         }
-        return json.dumps(block) + "\n"
+        return json.dumps(block, cls=DecimalEncoder) + "\n"
     
     def _generate_suggestions(self, original_prompt: str, results_df: pd.DataFrame) -> List[str]:
         """Generate follow-up question suggestions."""
