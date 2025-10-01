@@ -17,7 +17,7 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 import google.generativeai as genai
 
-# Logging 
+# Logging master
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
