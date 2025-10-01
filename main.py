@@ -30,14 +30,14 @@ class Config:
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         self.google_api_key = os.getenv("GOOGLE_API_KEY")
         self.max_scan_bytes = int(os.getenv("MAX_SCAN_BYTES", 10 * 1024**3))
-        # self.service_account_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        self.service_account_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
     def setup(self):
         try:
-            # if self.service_account_file:
-            #     creds = service_account.Credentials.from_service_account_file(self.service_account_file)
-            #     bq_client = bigquery.Client(credentials=creds, project=self.bq_project)
-            # if:
+            if self.service_account_file:
+                creds = service_account.Credentials.from_service_account_file(self.service_account_file)
+                bq_client = bigquery.Client(credentials=creds, project=self.bq_project)
+            else:
                 bq_client = bigquery.Client(project=self.bq_project)
         except Exception as e:
             logger.error(f"Failed to create BigQuery client: {e}")
