@@ -2,7 +2,6 @@ import os
 import re
 import json
 import logging
-import difflib
 import asyncio
 from typing import List, Dict, Optional, AsyncGenerator
 from datetime import datetime, date
@@ -57,33 +56,28 @@ REPORT_CONFIG = {
     "Madkpi_data_view": {
         "table": os.getenv("PARTNER_TABLE", "Madkpi_data_view"),
         "row_limit": int(os.getenv("PARTNER_ROW_LIMIT", "1000")),
-        "description": "Advertiser/Partner level performance table."
+        "description": "Advertiser/Partner level performance data with impressions, clicks, revenue",
+        "schema_summary": "date, advertiser_id, advertiser_name, advertiser_currency, partner_currency, impressions, clicks, revenue_partner_currency",
+        "key_columns": {
+            "cost": "NOT AVAILABLE - use revenue_partner_currency instead",
+            "advertiser": "advertiser_name, advertiser_id",
+            "revenue": "revenue_partner_currency"
+        }
     },
     "LI_level_ads_monitoring_view": {
         "table": os.getenv("CREATIVE_TABLE", "LI_level_ads_monitoring_view"),
         "row_limit": int(os.getenv("CREATIVE_ROW_LIMIT", "1000")),
-        "description": "Line Item level performance table."
+        "description": "Line Item level granular performance including campaign, IO, creative details",
+        "schema_summary": "date, partner_name, advertiser_name, campaign_name, io_name, li_name, device_type, country, impressions, clicks, total_conversions, ctr, revenue, media_cost",
+        "key_columns": {
+            "cost": "media_cost (NOT 'cost' or 'spend')",
+            "advertiser": "advertiser_name, advertiser_id",
+            "campaign": "campaign_name, campaign_id",
+            "conversions": "total_conversions, post_click_conversions, post_view_conversions",
+            "revenue": "revenue (in advertiser currency)"
+        }
     }
 }
-
-# Keywords for in-scope detection
-SCHEMA_LI = [
-    "date","partner_name","partner_id","advertiser_name","advertiser_id","campaign_name",
-    "campaign_id","io_name","io_id","li_name","li_id","fl_activity_name","fl_activity_id",
-    "advertiser_currency","advertiser_timezone","device_type","operating_system","country",
-    "region","impressions","clicks","billable_impressions","active_view_viewable_impressions",
-    "total_conversions","post_view_conversions","ctr","post_click_conversions","revenue",
-    "complete_views_video","midpoint_views_video","media_cost","cron_ts"
-]
-
-SCHEMA_MADKPI = [
-    "date","advertiser_id","advertiser_name","advertiser_currency",
-    "partner_currency","impressions","clicks","revenue_partner_currency"
-]
-
-# Build DV360 keywords dynamically from schemas
-DV360_KEYWORDS = sorted(set(SCHEMA_MADKPI + SCHEMA_LI))
-GENERIC_IN_SCOPE = ["row", "rows", "data", "sample", "show table", "schema"]
 
 # Helpers
 class DecimalEncoder(json.JSONEncoder):
@@ -100,90 +94,135 @@ class DecimalEncoder(json.JSONEncoder):
             return None
         return super().default(obj)
 
-def is_in_scope(question: str, threshold: float = 0.7) -> bool:
-    q_lower = question.lower()
-    tokens = re.findall(r"\w+", q_lower)
-    token_set = set(tokens)
+# LLM-based scope and table detection
+class IntelligentScopeDetector:
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        
+    def is_in_scope(self, question: str) -> Dict[str, any]:
+        """
+        Use LLM to determine if question is related to DV360/advertising analytics
+        Returns: {"in_scope": bool, "reason": str, "confidence": str}
+        """
+        prompt = f"""You are a classifier for a DV360 advertising analytics system.
 
-    # Exact token matches
-    for kw in DV360_KEYWORDS:
-        kw_tokens = re.findall(r"\w+", kw.lower())
-        if all(t in token_set for t in kw_tokens):
-            return True
+Available data domains:
+- Advertiser/Partner performance (impressions, clicks, revenue, dates)
+- Campaign and Line Item performance (conversions, CTR, media cost, device types, countries)
+- DV360 advertising metrics and KPIs
 
-    if any(g in q_lower for g in GENERIC_IN_SCOPE):
-        return True
+Question: "{question}"
 
-    # Fuzzy token match
-    for word in tokens:
-        best = difflib.get_close_matches(word, DV360_KEYWORDS + GENERIC_IN_SCOPE, n=1, cutoff=threshold)
-        if best:
-            logger.info(f"Fuzzy matched '{word}' -> '{best[0]}'")
-            return True
+Determine if this question can be answered using DV360 advertising data.
 
-    return False
+Respond ONLY with valid JSON:
+{{
+  "in_scope": true/false,
+  "reason": "brief explanation",
+  "confidence": "high/medium/low"
+}}
 
-def tokenize_keywords(keywords):
-    """Expand schema keywords into tokens (split underscores)."""
-    expanded = []
-    for kw in keywords:
-        parts = kw.lower().replace("_", " ").split()
-        expanded.extend(parts)
-    return set(expanded)
+Examples of IN SCOPE:
+- "top advertisers by revenue"
+- "show me campaign performance last week"
+- "which countries have highest CTR"
+- "compare impressions across partners"
 
-# Preprocess schema tokens
-madkpi_tokens = tokenize_keywords(SCHEMA_MADKPI)
-li_level_tokens = tokenize_keywords(SCHEMA_LI)
+Examples of OUT OF SCOPE:
+- "what's the weather today"
+- "tell me a joke"
+- "how to cook pasta"
+- "latest news headlines"
+"""
+        try:
+            model = genai.GenerativeModel(self.model_name)
+            response = model.generate_content(prompt)
+            result_text = response.text.strip()
+            
+            # Extract JSON from markdown code blocks if present
+            if "```json" in result_text:
+                result_text = result_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in result_text:
+                result_text = result_text.split("```")[1].split("```")[0].strip()
+            
+            result = json.loads(result_text)
+            logger.info(f"Scope detection: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Scope detection failed: {e}, defaulting to in-scope")
+            # Default to in-scope to avoid blocking legitimate queries
+            return {"in_scope": True, "reason": "Classification error, allowing query", "confidence": "low"}
+    
+    def detect_report_level(self, question: str) -> Dict[str, any]:
+        """
+        Use LLM to determine which table/report level is best for the question
+        Returns: {"table": str, "reason": str, "confidence": str}
+        """
+        tables_info = "\n".join([
+            f"- {name}: {config['description']}\n  Columns: {config['schema_summary']}\n  Key: {config.get('key_columns', {})}"
+            for name, config in REPORT_CONFIG.items()
+        ])
+        
+        prompt = f"""You are a data expert for DV360 advertising analytics.
 
-def fuzzy_score(tokens, keyword_tokens, cutoff=0.8):
-    score = 0
-    for word in tokens:
-        if word in keyword_tokens:
-            score += 1
-        else:
-            best = difflib.get_close_matches(word, keyword_tokens, n=1, cutoff=cutoff)
-            if best:
-                score += 1
-    return score
+Available tables:
+{tables_info}
 
-def detect_report_level(question: str) -> Optional[str]:
-    tokens = re.findall(r"\w+", question.lower())
-    madkpi_score = fuzzy_score(tokens, madkpi_tokens)
-    li_score = fuzzy_score(tokens, li_level_tokens)
-    logger.info(f"Schema detection → Madkpi={madkpi_score}, LI={li_score}")
+Question: "{question}"
 
-    if madkpi_score > li_score:
-        return "Madkpi_data_view"
-    elif li_score > madkpi_score:
-        return "LI_level_ads_monitoring_view"
-    else:
-        return None
+Select the MOST APPROPRIATE table based on the columns needed.
 
-def find_best_table_match(table_candidates: List[str], preferred_names: List[str], threshold: float = 0.6) -> Optional[str]:
-    lower_candidates = {t.lower(): t for t in table_candidates}
-    for name in preferred_names:
-        if not name:
-            continue
-        if name.lower() in lower_candidates:
-            return lower_candidates[name.lower()]
-    for pref in preferred_names:
-        if not pref:
-            continue
-        for t in table_candidates:
-            if pref.lower() in t.lower():
-                return t
-    for pref in preferred_names:
-        if not pref:
-            continue
-        matches = difflib.get_close_matches(pref.lower(), [t.lower() for t in table_candidates], n=1, cutoff=threshold)
-        if matches:
-            picked_lower = matches[0]
-            return lower_candidates.get(picked_lower, picked_lower)
-    return None
+CRITICAL RULES:
+1. For CPC (cost per click), CPA (cost per action), ROAS, or any COST/SPEND analysis:
+   → Use LI_level_ads_monitoring_view (has media_cost column)
+   
+2. For revenue-only analysis without cost:
+   → Can use Madkpi_data_view (has revenue_partner_currency)
+   
+3. For campaign/line-item/creative level details:
+   → Use LI_level_ads_monitoring_view (granular data)
+   
+4. For high-level advertiser/partner summaries:
+   → Use Madkpi_data_view (aggregated data)
+
+Respond ONLY with valid JSON:
+{{
+  "table": "exact_table_name",
+  "reason": "why this table is best",
+  "confidence": "high/medium/low"
+}}
+"""
+        try:
+            model = genai.GenerativeModel(self.model_name)
+            response = model.generate_content(prompt)
+            result_text = response.text.strip()
+            
+            # Extract JSON from markdown code blocks if present
+            if "```json" in result_text:
+                result_text = result_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in result_text:
+                result_text = result_text.split("```")[1].split("```")[0].strip()
+            
+            result = json.loads(result_text)
+            
+            # Validate table name
+            if result.get("table") not in REPORT_CONFIG:
+                logger.warning(f"Invalid table selected: {result.get('table')}, using default")
+                result["table"] = config.default_table
+                result["confidence"] = "low"
+            
+            logger.info(f"Table detection: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Table detection failed: {e}, using default")
+            return {
+                "table": config.default_table,
+                "reason": f"Classification error: {str(e)}",
+                "confidence": "low"
+            }
 
 # BigQuery Manager with CACHING and LAZY LOADING
 class BigQueryManager:
-    # Class-level cache for schema info
     _schema_cache = {}
     
     def __init__(self, client: bigquery.Client, dataset: str, table: str):
@@ -191,11 +230,9 @@ class BigQueryManager:
         self.dataset = dataset
         self.table = table
         self.available_columns: List[str] = []
-        # LAZY LOADING - only fetch columns when needed
         self._columns_loaded = False
 
     def _ensure_columns_loaded(self):
-        """Lazy load columns only when needed"""
         if not self._columns_loaded:
             cache_key = f"{self.client.project}.{self.dataset}.{self.table}"
             if cache_key in BigQueryManager._schema_cache:
@@ -208,10 +245,8 @@ class BigQueryManager:
             self._columns_loaded = True
 
     def _get_table_columns(self) -> List[str]:
-        """Optimized column fetching - only metadata, no data"""
         try:
             table_name_only = self.table.split('.')[-1]
-            # Only fetch column metadata - very fast
             query = f"""
             SELECT column_name, data_type
             FROM `{self.client.project}.{self.dataset}.INFORMATION_SCHEMA.COLUMNS`
@@ -226,7 +261,7 @@ class BigQueryManager:
 
     def execute_query(self, sql_query: str, dry_run: bool = False) -> pd.DataFrame:
         try:
-            job_config = bigquery.QueryJobConfig(dry_run=dry_run, use_query_cache=True)  # Enable cache
+            job_config = bigquery.QueryJobConfig(dry_run=dry_run, use_query_cache=True)
             job = self.client.query(sql_query, job_config=job_config)
             if dry_run:
                 return job.total_bytes_processed
@@ -237,8 +272,6 @@ class BigQueryManager:
             raise
 
     def get_sample_data(self, limit: int = 3) -> pd.DataFrame:
-        """Optimized sample data - with date filter and reduced rows"""
-        # Add date filter to avoid full table scan
         query = f"""
         SELECT * 
         FROM `{self.client.project}.{self.dataset}.{self.table}` 
@@ -248,23 +281,85 @@ class BigQueryManager:
         return self.execute_query(query)
 
     def get_table_schema(self) -> str:
-        """Optimized schema info - uses cached columns, minimal sample"""
+        """Get comprehensive schema with ALL columns for accurate SQL generation"""
         try:
-            self._ensure_columns_loaded()  # Load columns lazily
-            
-            # Return lightweight schema without sample data
+            self._ensure_columns_loaded()
+            # Return ALL columns, not just first 20 - critical for accurate SQL generation
             schema_info = f"Table: {self.client.project}.{self.dataset}.{self.table}\n"
-            schema_info += f"Columns ({len(self.available_columns)}): {', '.join(self.available_columns[:20])}"
-            if len(self.available_columns) > 20:
-                schema_info += f"... and {len(self.available_columns) - 20} more"
-            
+            schema_info += f"Available Columns:\n"
+            for col in self.available_columns:
+                schema_info += f"  - {col}\n"
             return schema_info
         except Exception as e:
             logger.error(f"Failed to get table schema: {e}")
             return f"Table: {self.client.project}.{self.dataset}.{self.table}"
 
-    def get_detailed_schema_with_sample(self) -> Dict:
-        """Separate method for when sample data is actually needed"""
+    def validate_sql_columns(self, sql_query: str) -> tuple[bool, str]:
+        """
+        Lightweight validation - just check the actual column references
+        Returns: (is_valid, error_message)
+        """
+        self._ensure_columns_loaded()
+        
+        # Extract clean column names from schema
+        available_col_names = set([col.split(' (')[0].lower() for col in self.available_columns])
+        
+        import re
+        
+        # Find column references after table alias (e.g., t.column_name)
+        # This is more reliable than trying to parse entire SQL
+        alias_column_pattern = r'\w+\.([a-z_][a-z0-9_]*)'
+        alias_columns = re.findall(alias_column_pattern, sql_query.lower())
+        
+        # Also find bare column names in common contexts (more conservative)
+        # Only in SELECT and GROUP BY to avoid false positives
+        select_match = re.search(r'select\s+(.+?)\s+from', sql_query.lower(), re.DOTALL)
+        groupby_match = re.search(r'group\s+by\s+(.+?)(?:order|having|limit|$)', sql_query.lower(), re.DOTALL)
+        
+        bare_columns = []
+        if select_match:
+            select_part = select_match.group(1)
+            # Remove function calls like SUM(...), CAST(...)
+            select_part = re.sub(r'\b\w+\s*\([^)]*\)', '', select_part)
+            # Extract remaining identifiers
+            bare_columns.extend(re.findall(r'\b([a-z_][a-z0-9_]{2,})\b', select_part))
+        
+        if groupby_match:
+            groupby_part = groupby_match.group(1)
+            bare_columns.extend(re.findall(r'\b([a-z_][a-z0-9_]{2,})\b', groupby_part))
+        
+        # Combine all potential columns
+        all_potential = set(alias_columns + bare_columns)
+        
+        # SQL keywords to filter out
+        sql_keywords = {
+            'select', 'from', 'where', 'group', 'order', 'having', 'limit',
+            'desc', 'asc', 'distinct', 'date', 'float64', 'string', 'int64',
+            'cast', 'interval', 'current_date', 'date_sub'
+        }
+        
+        # Find invalid columns
+        invalid = []
+        for col in all_potential:
+            if col in sql_keywords or len(col) < 3:
+                continue
+            if col not in available_col_names:
+                invalid.append(col)
+        
+        if invalid:
+            # Show helpful suggestions
+            suggestions = []
+            for inv_col in invalid[:3]:
+                # Try to find similar column names
+                similar = [ac for ac in available_col_names if inv_col in ac or ac in inv_col]
+                if similar:
+                    suggestions.append(f"'{inv_col}' (try: {', '.join(similar[:2])})")
+                else:
+                    suggestions.append(f"'{inv_col}'")
+            
+            return False, f"Columns not found: {', '.join(suggestions)}."
+        
+        return True, ""
         self._ensure_columns_loaded()
         try:
             sample_df = self.get_sample_data(3)
@@ -277,11 +372,9 @@ class BigQueryManager:
             return {"schema": f"Columns: {', '.join(self.available_columns)}", "sample": ""}
 
     def list_tables_in_dataset(self) -> List[str]:
-        """Cached table listing"""
         cache_key = f"tables_{self.client.project}_{self.dataset}"
         if cache_key in BigQueryManager._schema_cache:
             return BigQueryManager._schema_cache[cache_key]
-        
         try:
             tables = self.client.list_tables(f"{self.client.project}.{self.dataset}")
             table_list = [t.table_id for t in tables]
@@ -299,52 +392,62 @@ class GeminiManager:
             logger.warning("Gemini API key not configured. Generation will fail if attempted.")
 
     def generate_sql_from_prompt(self, user_prompt: str, table_schema: str, full_table_name: str, row_limit: int) -> str:
-        # Optimized prompt - more concise
-        prompt = f"""
-You are a BigQuery SQL expert for DV360. Generate ONLY the SQL query.
+        prompt = f"""You are a BigQuery SQL expert for DV360 advertising analytics. Generate ONLY the SQL query.
 
-Table: {full_table_name}
 {table_schema}
 
-User: "{user_prompt}"
+User Question: "{user_prompt}"
 
-Rules:
-- Use ONLY `{full_table_name}` in FROM
-- ALWAYS add: WHERE DATE(date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-- Use SAFE_DIVIDE for divisions
-- Cast NUMERIC to FLOAT64 when aggregating
-- Case-insensitive LIKE for partial names
-- Add LIMIT {row_limit} if no aggregation
-- If out of scope: return "Out of scope"
+CRITICAL RULES:
+1. Use ONLY columns that exist in the schema above - check carefully!
+2. Column names are CASE-SENSITIVE - use exact names from schema
+3. Use ONLY `{full_table_name}` in FROM clause
+4. ALWAYS add: WHERE DATE(date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+5. Use SAFE_DIVIDE for divisions to avoid divide-by-zero errors
+6. Cast numeric columns to FLOAT64 when aggregating: CAST(column_name AS FLOAT64)
+7. For case-insensitive text matching use: LOWER(column_name) LIKE LOWER('%search%')
+8. Add LIMIT {row_limit} if no aggregation (no GROUP BY)
+9. For "top" queries, use ORDER BY DESC with LIMIT
+10. Use meaningful column aliases
 
-Return ONLY SQL, no markdown.
+Common column mappings for this domain:
+- Cost/Spend → use "media_cost" (not "cost" or "spend")
+- Advertiser → use "advertiser_name" and "advertiser_id"
+- Campaign → use "campaign_name" and "campaign_id"
+- Impressions → use "impressions"
+- Clicks → use "clicks"
+- CTR → use "ctr" or calculate as SAFE_DIVIDE(clicks, impressions)
+- Revenue → use "revenue" (in advertiser currency)
+- Conversions → use "total_conversions" or specific types
+
+Return ONLY the SQL query with no markdown formatting, no explanations, no code blocks.
 """
         try:
             model = genai.GenerativeModel(self.model_name)
             response = model.generate_content(prompt)
             sql_query = response.text.strip()
-            return sql_query.replace("```sql", "").replace("```", "").strip()
+            # Remove any markdown formatting
+            sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+            return sql_query
         except Exception as e:
             logger.error(f"SQL generation failed: {e}")
             raise
 
     def analyze_results(self, user_prompt: str, sql_query: str, results_df: pd.DataFrame) -> str:
         try:
-            # Reduce sample size for analysis
             df_sample = results_df.head(5).copy()
             for col in df_sample.columns:
                 df_sample[col] = df_sample[col].astype(str)
             
-            prompt = f"""
-User: {user_prompt}
-SQL: {sql_query}
-Sample (5 rows):
+            prompt = f"""User Question: {user_prompt}
+SQL Query: {sql_query}
+Sample Results (5 rows):
 {df_sample.to_string()}
 
-Provide brief:
-1) Summary
-2) Key insights
-3) Recommendations
+Provide brief analysis:
+1) Summary of findings
+2) Key insights (2-3 points)
+3) Actionable recommendations
 """
             model = genai.GenerativeModel(self.model_name)
             response = model.generate_content(prompt)
@@ -358,88 +461,100 @@ class AnalyticsService:
     def __init__(self):
         self.bq_client = config.setup()
         self.gemini_manager = GeminiManager(config.gemini_model)
-
-    def auto_select_table(self, question: str, report_level: Optional[str] = None, table_hint: Optional[str] = None) -> str:
-        bq_manager = BigQueryManager(self.bq_client, config.bq_dataset, config.default_table)
-        dataset_tables = bq_manager.list_tables_in_dataset()
-
-        if table_hint:
-            match = find_best_table_match(dataset_tables, [table_hint, table_hint.split('.')[-1]], threshold=0.5)
-            if match:
-                logger.info(f"Using table match from hint: {match}")
-                return match
-
-        candidates = []
-        if report_level and report_level in REPORT_CONFIG:
-            candidates.append(REPORT_CONFIG[report_level]["table"])
-        else:
-            detected = detect_report_level(question)
-            if detected and detected in REPORT_CONFIG:
-                candidates.append(REPORT_CONFIG[detected]["table"])
-
-        match = find_best_table_match(dataset_tables, candidates, threshold=0.5)
-        if match:
-            logger.info(f"Auto-selected table: {match}")
-            return match
-
-        if config.default_table in dataset_tables:
-            return config.default_table
-
-        if dataset_tables:
-            return dataset_tables[0]
-
-        return config.default_table
+        self.scope_detector = IntelligentScopeDetector(config.gemini_model)
 
     async def stream_analysis(self, user_prompt: str, report_level: Optional[str] = None, table_override: Optional[str] = None) -> AsyncGenerator[str, None]:
         def block(t: str, data: Dict):
             return json.dumps({"type": t, "timestamp": datetime.now().isoformat(), "data": data}, cls=DecimalEncoder) + "\n"
 
         try:
-            if not is_in_scope(user_prompt):
-                yield block("error", {"message": "Out of scope: I can only answer DV360-related questions."})
+            # Step 1: LLM-based scope detection
+            yield block("progress", {"message": "Understanding your question...", "percentage": 5})
+            scope_result = self.scope_detector.is_in_scope(user_prompt)
+            
+            if not scope_result.get("in_scope", False):
+                yield block("error", {
+                    "message": f"Out of scope: {scope_result.get('reason', 'Question not related to DV360 analytics')}",
+                    "suggestion": "Please ask questions about advertisers, campaigns, impressions, clicks, revenue, or other DV360 metrics."
+                })
                 return
 
-            yield block("progress", {"message": "Detecting best table...", "percentage": 5})
-            selected_table = self.auto_select_table(user_prompt, report_level, table_override)
+            # Step 2: LLM-based table detection
+            yield block("progress", {"message": "Selecting best data source...", "percentage": 10})
+            
+            if table_override:
+                selected_table = table_override
+                logger.info(f"Using table override: {selected_table}")
+            elif report_level and report_level in REPORT_CONFIG:
+                selected_table = REPORT_CONFIG[report_level]["table"]
+                logger.info(f"Using report_level: {selected_table}")
+            else:
+                table_result = self.scope_detector.detect_report_level(user_prompt)
+                selected_table = table_result.get("table", config.default_table)
+                logger.info(f"LLM selected table: {selected_table} (reason: {table_result.get('reason')})")
+
             full_table_name = f"{self.bq_client.project}.{config.bq_dataset}.{selected_table}"
-            yield block("progress", {"message": f"Selected table: {selected_table}", "percentage": 10})
+            yield block("progress", {"message": f"Using table: {selected_table}", "percentage": 15})
 
             bq_manager = BigQueryManager(self.bq_client, config.bq_dataset, selected_table)
-            # Get lightweight schema (no sample data)
             table_schema = bq_manager.get_table_schema()
 
-            row_limit = 1000
-            if report_level and report_level in REPORT_CONFIG:
-                row_limit = REPORT_CONFIG[report_level]["row_limit"]
-            else:
-                detected = detect_report_level(user_prompt)
-                if detected and detected in REPORT_CONFIG:
-                    row_limit = REPORT_CONFIG[detected]["row_limit"]
+            row_limit = REPORT_CONFIG.get(selected_table, {}).get("row_limit", 1000)
 
-            yield block("progress", {"message": "Generating SQL query...", "percentage": 20})
+            yield block("progress", {"message": "Generating SQL query...", "percentage": 25})
             try:
                 sql_query = self.gemini_manager.generate_sql_from_prompt(user_prompt, table_schema, full_table_name, row_limit)
             except Exception as e:
                 yield block("error", {"message": "SQL generation failed", "details": str(e)})
                 return
 
-            if not sql_query or "out of scope" in sql_query.lower() or sql_query.strip().startswith("❌"):
-                yield block("error", {"message": "Out of scope. I can only give DV360 related query"})
+            if not sql_query or len(sql_query.strip()) < 10:
+                yield block("error", {"message": "Failed to generate valid SQL query"})
                 return
 
             yield block("code", {"language": "sql", "content": sql_query, "title": "Generated SQL Query"})
-            yield block("progress", {"message": "Validating query...", "percentage": 40})
+            yield block("progress", {"message": "Validating query with BigQuery...", "percentage": 40})
 
+            # Use BigQuery's dry run for validation - it's more accurate than our regex parsing
             try:
                 scanned_bytes = bq_manager.execute_query(sql_query, dry_run=True)
                 scanned_mb = round(scanned_bytes / 1e6, 2)
             except Exception as e:
-                yield block("error", {"message": "Query validation failed", "details": str(e)})
-                return
+                error_msg = str(e)
+                logger.warning(f"Query validation failed: {error_msg}")
+                
+                # Check if it's a column/syntax error that we can retry
+                if "Unrecognized name" in error_msg or "Column" in error_msg or "not found" in error_msg:
+                    yield block("progress", {"message": "Fixing query based on BigQuery feedback...", "percentage": 35})
+                    try:
+                        # Extract the specific error and retry
+                        enhanced_prompt = f"""{user_prompt}
+
+IMPORTANT: Previous SQL query failed with error:
+{error_msg}
+
+Please generate a corrected query using ONLY the columns available in the schema."""
+                        
+                        sql_query = self.gemini_manager.generate_sql_from_prompt(enhanced_prompt, table_schema, full_table_name, row_limit)
+                        yield block("code", {"language": "sql", "content": sql_query, "title": "Corrected SQL Query"})
+                        
+                        # Try validation again
+                        try:
+                            scanned_bytes = bq_manager.execute_query(sql_query, dry_run=True)
+                            scanned_mb = round(scanned_bytes / 1e6, 2)
+                        except Exception as retry_error:
+                            yield block("error", {"message": "Query validation failed after retry", "details": str(retry_error)})
+                            return
+                    except Exception as regen_error:
+                        yield block("error", {"message": "Failed to regenerate query", "details": str(regen_error)})
+                        return
+                else:
+                    yield block("error", {"message": "Query validation failed", "details": error_msg})
+                    return
 
             yield block("progress", {"message": f"Will scan ~{scanned_mb} MB", "percentage": 50})
             if scanned_bytes and scanned_bytes > config.max_scan_bytes:
-                yield block("error", {"message": "⚠️ Query too expensive. Please refine your question."})
+                yield block("error", {"message": "⚠️ Query too expensive. Please refine your question to scan less data."})
                 return
 
             yield block("progress", {"message": "Executing query...", "percentage": 60})
@@ -450,7 +565,7 @@ class AnalyticsService:
                 return
 
             if results_df.empty:
-                yield block("error", {"message": "No results found", "details": "The query returned no rows."})
+                yield block("error", {"message": "No results found", "details": "The query returned no rows. Try adjusting your date range or criteria."})
                 return
 
             preview_rows = results_df.head(100)
@@ -481,9 +596,9 @@ class AnalyticsService:
 
             yield block("markdown", {"title": "Insights & Recommendations", "content": f"## AI Analysis\n\n{analysis}"})
             yield block("suggestions", {"title": "Follow-up questions", "suggestions": [
-                "Show trend over time",
-                "Break down by dimensions",
-                "Top performing segments"
+                "Show trend over time for this data",
+                "Break down by additional dimensions",
+                "Compare with previous period"
             ]})
             yield block("progress", {"message": "Complete!", "percentage": 100})
 
@@ -492,7 +607,7 @@ class AnalyticsService:
             yield block("error", {"message": "Analysis failed", "details": str(e)})
 
 # FastAPI App
-app = FastAPI(title="DV360 Analytics API", version="1.0.0", description="Natural language analytics for DV360 data")
+app = FastAPI(title="DV360 Analytics API", version="2.0.0", description="Natural language analytics for DV360 data with intelligent scope detection")
 
 app.add_middleware(
     CORSMiddleware,
@@ -515,20 +630,20 @@ async def startup_event():
     try:
         _ = config.setup()
         analytics_service = AnalyticsService()
-        logger.info("Analytics service initialized successfully")
+        logger.info("Analytics service with intelligent scope detection initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize analytics service: {e}")
         analytics_service = None
 
 @app.get("/")
 async def root():
-    return {"status": "healthy", "service": "DV360 Analytics API"}
+    return {"status": "healthy", "service": "DV360 Analytics API v2.0 - LLM-powered scope detection"}
 
 @app.get("/health")
 async def health_check():
     if analytics_service is None:
         return {"status": "degraded", "bigquery": "not-initialized", "gemini": "not-initialized", "timestamp": datetime.now().isoformat()}
-    return {"status": "healthy", "bigquery": "connected", "gemini": "configured" if config.google_api_key else "not-configured", "timestamp": datetime.now().isoformat()}
+    return {"status": "healthy", "bigquery": "connected", "gemini": "configured" if config.google_api_key else "not-configured", "scope_detection": "llm-powered", "timestamp": datetime.now().isoformat()}
 
 @app.get("/tables")
 async def list_tables():
