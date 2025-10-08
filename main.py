@@ -682,9 +682,9 @@ Please generate a corrected query using ONLY the columns available in the schema
                 "metrics": [
                     {"label": "Total Rows", "value": len(results_df), "format": "number"},
                     {"label": "Columns", "value": len(results_df.columns), "format": "number"},
-                    {"label": "Table", "value": selected_table, "format": "string"},
-                    {"label": "Date Range", "value": date_result.get('reason', 'All data'), "format": "string"},
-                    {"label": "Advertisers", "value": len(advertiser_ids), "format": "number"}
+                    # {"label": "Table", "value": selected_table, "format": "string"},
+                    # {"label": "Date Range", "value": date_result.get('reason', 'All data'), "format": "string"},
+                    # {"label": "Advertisers", "value": len(advertiser_ids), "format": "number"}
                 ]
             })
 
