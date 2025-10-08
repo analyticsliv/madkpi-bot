@@ -22,3 +22,8 @@ pydantic-core==2.20.1
 python-multipart==0.0.6
 
 db-dtypes>=1.1.1
+
+python-dotenv==1.0.0
+
+PyJWT==2.8.0
+
