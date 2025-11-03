@@ -802,7 +802,7 @@ class AnalyticsService:
             
             yield block("progress", {"message": f"Analyzing your question...", "percentage": 5})
             
-            # 🚀 OPTIMIZATION: Run all detection in parallel
+            #  OPTIMIZATION: Run all detection in parallel
             detection_results = await self.scope_detector.detect_all_parallel(user_prompt)
             scope_result = detection_results["scope"]
             date_result = detection_results["date"]
@@ -815,7 +815,7 @@ class AnalyticsService:
                 error_detail = f"{scope_result.get('reason', 'Question not related to DV360 analytics')}"
                 
                 if suggestion:
-                    error_detail += f"\n\n💡 Try this instead: \"{suggestion}\""
+                    error_detail += f"\n\n Try this instead: \"{suggestion}\""
                 
                 yield block("error", {
                     "message": "Out of Scope Query",
@@ -998,7 +998,7 @@ Please generate a corrected query using ONLY the columns available in the schema
                 "metrics": [
                     {"label": "Total Rows", "value": len(results_df), "format": "number"},
                     {"label": "Columns", "value": len(results_df.columns), "format": "number"},
-                    {"label": "Data Scanned", "value": f"{scanned_mb} MB", "format": "string"}
+                    # {"label": "Data Scanned", "value": f"{scanned_mb} MB", "format": "string"}
                 ]
             })
 
@@ -1015,14 +1015,14 @@ Please generate a corrected query using ONLY the columns available in the schema
             except Exception as e:
                 analysis = f"Analysis generation failed: {e}"
 
-            yield block("markdown", {"title": "📊 Insights & Recommendations", "content": analysis})
+            yield block("markdown", {"title": "Insights & Recommendations", "content": analysis})
             
             # Generate contextual suggestions based on results (optional for performance)
             contextual_suggestions = self.gemini_manager.generate_contextual_suggestions(
                 user_prompt, results_df, True
             )
             yield block("suggestions", {
-                "title": "💡 Follow-up questions", 
+                "title": "Follow-up questions", 
                 "suggestions": contextual_suggestions
             })
             
@@ -1189,5 +1189,5 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8080))
     logger.info(f"Starting DV360 Analytics API v2.2 (Optimized) on port {port}...")
-    logger.info("⚡ Performance optimizations active")
+    logger.info("Performance optimizations active")
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
