@@ -1191,3 +1191,5 @@ if __name__ == "__main__":
     logger.info(f"Starting DV360 Analytics API v2.2 (Optimized) on port {port}...")
     logger.info("Performance optimizations active")
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+
+    #Saumil-git
